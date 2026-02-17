@@ -1,0 +1,291 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ============================================
+    // HELPER FUNCTIONS
+    // ============================================
+    
+    // Check if user is authenticated
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    // Check if user is the document owner
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+    
+    // Check if user is admin (custom claim)
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.admin == true;
+    }
+    
+    // Check if user has premium subscription
+    function isPremium() {
+      return isSignedIn() && 
+             (request.auth.token.subscriptionTier == 'premium' || 
+              request.auth.token.subscriptionTier == 'family');
+    }
+    
+    // Check if user has family subscription
+    function isFamily() {
+      return isSignedIn() && request.auth.token.subscriptionTier == 'family';
+    }
+    
+    // Validate timestamp is within reasonable range
+    function isValidTimestamp(ts) {
+      return ts is timestamp && 
+             ts > timestamp.date(2020, 1, 1) && 
+             ts < timestamp.date(2050, 12, 31);
+    }
+    
+    // Validate enum values
+    function isValidSubscriptionTier(tier) {
+      return tier in ['free', 'premium', 'family'];
+    }
+    
+    function isValidWarrantyType(type) {
+      return type in ['manufacturer', 'extended', 'store', 'credit_card'];
+    }
+    
+    function isValidWarrantyStatus(status) {
+      return status in ['active', 'expired', 'claimed', 'archived'];
+    }
+    
+    function isValidReminderType(type) {
+      return type in ['email', 'push', 'sms'];
+    }
+    
+    function isValidReminderStatus(status) {
+      return status in ['pending', 'sent', 'failed', 'canceled'];
+    }
+    
+    function isValidClaimStatus(status) {
+      return status in ['draft', 'submitted', 'in_review', 'approved', 'denied', 'completed', 'canceled'];
+    }
+    
+    // ============================================
+    // USERS COLLECTION
+    // ============================================
+    
+    match /users/{userId} {
+      // Read: User can read their own profile, admins can read all
+      allow read: if isOwner(userId) || isAdmin();
+      
+      // Create: Only on signup, userId must match auth.uid
+      allow create: if isSignedIn() && 
+                      request.auth.uid == userId &&
+                      request.resource.data.userId == userId &&
+                      request.resource.data.email == request.auth.token.email &&
+                      isValidSubscriptionTier(request.resource.data.subscriptionTier) &&
+                      request.resource.data.createdAt == request.time &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Update: User can update their own profile (except subscription fields)
+      allow update: if isOwner(userId) &&
+                      request.resource.data.userId == userId &&
+                      request.resource.data.email == resource.data.email && // Can't change email
+                      request.resource.data.subscriptionTier == resource.data.subscriptionTier && // Can't change tier
+                      request.resource.data.createdAt == resource.data.createdAt &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Admins can update subscription fields
+      allow update: if isAdmin() &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Delete: Soft delete only (set isDeleted flag)
+      allow update: if isOwner(userId) &&
+                      request.resource.data.isDeleted == true &&
+                      request.resource.data.deletedAt == request.time;
+      
+      // User preferences subcollection
+      match /preferences/{prefId} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId) &&
+                       request.resource.data.updatedAt == request.time;
+      }
+    }
+    
+    // ============================================
+    // PRODUCTS COLLECTION
+    // ============================================
+    
+    match /products/{productId} {
+      // Read: Owner or admin can read
+      allow read: if isSignedIn() && 
+                    (resource.data.userId == request.auth.uid || isAdmin());
+      
+      // Create: Must be authenticated, userId must match auth
+      allow create: if isSignedIn() &&
+                      request.resource.data.userId == request.auth.uid &&
+                      isValidWarrantyType(request.resource.data.warrantyType) &&
+                      isValidWarrantyStatus(request.resource.data.warrantyStatus) &&
+                      isValidTimestamp(request.resource.data.warrantyStartDate) &&
+                      isValidTimestamp(request.resource.data.warrantyEndDate) &&
+                      request.resource.data.warrantyEndDate > request.resource.data.warrantyStartDate &&
+                      request.resource.data.createdAt == request.time &&
+                      request.resource.data.updatedAt == request.time &&
+                      // Check product limits based on subscription tier
+                      (request.auth.token.subscriptionTier == 'free' && 
+                       request.auth.token.productsCount < 5 ||
+                       request.auth.token.subscriptionTier == 'premium' && 
+                       request.auth.token.productsCount < 100 ||
+                       request.auth.token.subscriptionTier == 'family' && 
+                       request.auth.token.productsCount < 500);
+      
+      // Update: Owner can update their own products
+      allow update: if isSignedIn() &&
+                      resource.data.userId == request.auth.uid &&
+                      request.resource.data.userId == resource.data.userId &&
+                      request.resource.data.productId == resource.data.productId &&
+                      isValidWarrantyType(request.resource.data.warrantyType) &&
+                      isValidWarrantyStatus(request.resource.data.warrantyStatus) &&
+                      request.resource.data.createdAt == resource.data.createdAt &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Admins can update any product
+      allow update: if isAdmin();
+      
+      // Delete: Hard delete only allowed for admins, users should archive
+      allow delete: if isAdmin();
+      
+      // Archive: Owner can archive (soft delete)
+      allow update: if isSignedIn() &&
+                      resource.data.userId == request.auth.uid &&
+                      request.resource.data.isArchived == true &&
+                      request.resource.data.archivedAt == request.time;
+    }
+    
+    // ============================================
+    // WARRANTIES COLLECTION
+    // ============================================
+    
+    match /warranties/{warrantyId} {
+      // Read: Owner or admin
+      allow read: if isSignedIn() && 
+                    (resource.data.userId == request.auth.uid || isAdmin());
+      
+      // Create: Premium users only
+      allow create: if isPremium() &&
+                      request.resource.data.userId == request.auth.uid &&
+                      isValidTimestamp(request.resource.data.startDate) &&
+                      isValidTimestamp(request.resource.data.endDate) &&
+                      request.resource.data.endDate > request.resource.data.startDate &&
+                      request.resource.data.createdAt == request.time &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Update: Owner can update
+      allow update: if isSignedIn() &&
+                      resource.data.userId == request.auth.uid &&
+                      request.resource.data.userId == resource.data.userId &&
+                      request.resource.data.warrantyId == resource.data.warrantyId &&
+                      request.resource.data.createdAt == resource.data.createdAt &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Delete: Owner or admin
+      allow delete: if isSignedIn() &&
+                      (resource.data.userId == request.auth.uid || isAdmin());
+    }
+    
+    // ============================================
+    // REMINDERS COLLECTION
+    // ============================================
+    
+    match /reminders/{reminderId} {
+      // Read: Owner or admin
+      allow read: if isSignedIn() && 
+                    (resource.data.userId == request.auth.uid || isAdmin());
+      
+      // Create: System/admin only (created via Cloud Functions)
+      allow create: if isAdmin();
+      
+      // Update: Admin only (for status updates)
+      allow update: if isAdmin() &&
+                      request.resource.data.userId == resource.data.userId &&
+                      request.resource.data.productId == resource.data.productId &&
+                      isValidReminderStatus(request.resource.data.status) &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Delete: Admin only (for cleanup operations)
+      allow delete: if isAdmin();
+    }
+    
+    // ============================================
+    // CLAIMS COLLECTION
+    // ============================================
+    
+    match /claims/{claimId} {
+      // Read: Owner or admin
+      allow read: if isSignedIn() && 
+                    (resource.data.userId == request.auth.uid || isAdmin());
+      
+      // Create: Premium users can create claims
+      allow create: if isPremium() &&
+                      request.resource.data.userId == request.auth.uid &&
+                      isValidClaimStatus(request.resource.data.claimStatus) &&
+                      isValidTimestamp(request.resource.data.claimDate) &&
+                      request.resource.data.createdAt == request.time &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Update: Owner can update their claims (but not admin fields)
+      allow update: if isSignedIn() &&
+                      resource.data.userId == request.auth.uid &&
+                      request.resource.data.userId == resource.data.userId &&
+                      request.resource.data.claimId == resource.data.claimId &&
+                      isValidClaimStatus(request.resource.data.claimStatus) &&
+                      request.resource.data.createdAt == resource.data.createdAt &&
+                      request.resource.data.updatedAt == request.time &&
+                      // Can't modify admin notes
+                      request.resource.data.adminNotes == resource.data.adminNotes;
+      
+      // Admins can update any claim
+      allow update: if isAdmin() &&
+                      request.resource.data.updatedAt == request.time;
+      
+      // Delete: Owner can delete drafts, admins can delete any
+      allow delete: if (isSignedIn() && 
+                       resource.data.userId == request.auth.uid &&
+                       resource.data.claimStatus == 'draft') || 
+                       isAdmin();
+    }
+    
+    // ============================================
+    // ACTIVITIES COLLECTION (Audit Log)
+    // ============================================
+    
+    match /activities/{activityId} {
+      // Read: Owner or admin can read their activities
+      allow read: if isSignedIn() && 
+                    (resource.data.userId == request.auth.uid || isAdmin());
+      
+      // Create: System/admin only (created via Cloud Functions)
+      allow create: if isAdmin();
+      
+      // Update/Delete: Admin only
+      allow update, delete: if isAdmin();
+    }
+    
+    // ============================================
+    // WARRANTY DATABASE (Public Read-Only)
+    // ============================================
+    
+    match /warranty_database/{templateId} {
+      // Read: Any authenticated user (public warranty info)
+      allow read: if isSignedIn() && resource.data.isActive == true;
+      
+      // Write: Admin only
+      allow create, update, delete: if isAdmin();
+    }
+    
+    // ============================================
+    // DEFAULT DENY
+    // ============================================
+    
+    // Deny all other access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
