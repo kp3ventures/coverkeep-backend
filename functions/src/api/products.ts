@@ -3,6 +3,7 @@ import * as admin from 'firebase-admin';
 import axios from 'axios';
 import { authenticateUser, AuthRequest } from '../middleware/auth';
 import { validate, schemas } from '../middleware/validation';
+import { identifyProduct } from '../services/productIdentification';
 
 const router = Router();
 
@@ -511,6 +512,74 @@ router.post('/lookup-barcode', async (req, res) => {
       error: {
         code: 'LOOKUP_FAILED',
         message: 'Failed to lookup barcode. Please try again or enter details manually.'
+      }
+    });
+  }
+});
+
+/**
+ * POST /api/v1/products/identify
+ * Identify product from image using GPT-4 Vision
+ */
+router.post('/identify', async (req, res) => {
+  try {
+    const { image, userId } = req.body;
+    
+    // Validate required fields
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_IMAGE',
+          message: 'Image is required and must be a base64 string or URL'
+        }
+      });
+    }
+    
+    if (!userId || typeof userId !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'INVALID_USER_ID',
+          message: 'userId is required for logging and analytics'
+        }
+      });
+    }
+    
+    // Call product identification service
+    const result = await identifyProduct(image, userId);
+    
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        product: null,
+        error: result.error
+      });
+    }
+    
+    // Return successful identification
+    return res.json({
+      success: true,
+      product: {
+        name: result.result!.name,
+        brand: result.result!.brand || null,
+        category: result.result!.category || null,
+        model: result.result!.model || null,
+        color: result.result!.color || null,
+        estimatedYear: result.result!.estimatedYear || null,
+        confidence: result.result!.confidence,
+        suggestedWarranty: result.result!.suggestedWarranty || null
+      },
+      error: null
+    });
+  } catch (error) {
+    console.error('Product identification endpoint error:', error);
+    return res.status(500).json({
+      success: false,
+      product: null,
+      error: {
+        code: 'SERVER_ERROR',
+        message: 'An unexpected error occurred'
       }
     });
   }
